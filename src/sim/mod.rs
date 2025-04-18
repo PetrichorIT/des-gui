@@ -56,11 +56,7 @@ pub fn sim() -> Runtime<Sim<()>> {
 
     let mut rt = Builder::seeded(123).build(sim);
     for i in 0..100 {
-        rt.add_message_onto(
-            gate.clone(),
-            Message::new().id(i).build(),
-            (i as f64).into(),
-        );
+        rt.add_message_onto(gate.clone(), Message::default().id(i), (i as f64).into());
     }
 
     rt

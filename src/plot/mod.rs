@@ -1,8 +1,9 @@
-use des::time::SimTime;
+use des::{net::module::RawProp, time::SimTime};
 use egui::{Context, ScrollArea, SidePanel, panel::Side};
 use egui_plot::{Legend, Line, Plot, PlotPoint, PlotPoints};
+use serde_yml::Value;
 
-use crate::{Application, inspector::PropReader};
+use crate::Application;
 
 impl Application {
     pub fn show_plot(&mut self, ctx: &Context) {
@@ -54,12 +55,12 @@ pub trait Tracer {
 
 pub struct PropTracer {
     key: String,
-    prop: PropReader,
+    prop: RawProp,
     values: Vec<PlotPoint>,
 }
 
 impl PropTracer {
-    pub const fn new(key: String, prop: PropReader) -> Self {
+    pub const fn new(key: String, prop: RawProp) -> Self {
         Self {
             key,
             prop,
@@ -74,7 +75,10 @@ impl Tracer for PropTracer {
     }
 
     fn update(&mut self) {
-        if let Some(y) = self.prop.get_f64() {
+        if let Some(y) = self.prop.into_value().and_then(|value| match value {
+            Value::Number(n) => n.as_f64(),
+            _ => None,
+        }) {
             let x = SimTime::now().as_secs_f64();
             if let Some(last_y) = self.values.last().map(|p| p.y) {
                 if last_y != y {

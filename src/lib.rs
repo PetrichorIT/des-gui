@@ -1,15 +1,21 @@
-use ::tracing::info;
 use des::{prelude::*, tracing::FALLBACK_LOG_LEVEL};
-use egui::{Align, Color32, ComboBox, Direction, Layout, PopupCloseBehavior, SidePanel};
+use egui::{
+    Align, CentralPanel, Color32, ComboBox, Id, Image, Layout, PopupCloseBehavior, ViewportBuilder,
+};
 use egui_graphs::{Graph, SettingsInteraction, SettingsNavigation, SettingsStyle};
 use petgraph::{Undirected, prelude::StableUnGraph};
 use plot::Tracer;
 use std::{
     collections::HashMap,
-    mem::{self, MaybeUninit, forget},
+    env::temp_dir,
+    fs::File,
+    io::Write,
+    mem::{self, forget},
+    path::PathBuf,
+    process::{Command, Stdio},
     time::{Duration, Instant},
 };
-use tracing_subscriber::{EnvFilter, filter::Directive, util::SubscriberInitExt};
+use tracing_subscriber::{EnvFilter, filter::Directive, fmt::Layer, layer::SubscriberExt};
 
 pub mod sim;
 pub mod tracing;
@@ -18,7 +24,7 @@ mod inspector;
 mod plot;
 
 use inspector::ModuleInspector;
-use tracing::{MachineReadableFormat, MakeTracer};
+use tracing::GuiTracingObserver;
 
 pub fn launch_with_gui(f: impl FnOnce() -> Runtime<Sim<()>>) -> eframe::Result {
     let mut native_options = eframe::NativeOptions::default();
@@ -34,16 +40,18 @@ pub fn launch_with_gui(f: impl FnOnce() -> Runtime<Sim<()>>) -> eframe::Result {
 /// We derive Deserialize/Serialize so we can persist app state on shutdown.
 pub struct Application {
     // Example stuff:
-    logs: MakeTracer,
+    logs: GuiTracingObserver,
     last_frame: Instant,
 
     rt: Rt,
     param: ExecutionParameters,
 
+    dir: PathBuf,
+
     modals: Vec<ModuleInspector>,
     traces: Vec<Vec<Box<dyn Tracer>>>,
 
-    graph: Graph<(), (), Undirected>,
+    enable_graph: bool,
 }
 
 enum Rt {
@@ -52,6 +60,13 @@ enum Rt {
 }
 
 impl Rt {
+    // pub fn sim(&self) -> &Sim<()> {
+    //     match self {
+    //         Self::Finished(sim, _, _) => sim,
+    //         Self::Runtime(sim) => &sim.app,
+    //     }
+    // }
+
     fn finish(&mut self) -> Result<(), RuntimeError> {
         match self {
             Self::Runtime(rt) => {
@@ -88,17 +103,30 @@ enum Speed {
 
 impl Application {
     /// Called once before the first frame.
-    pub fn new(_: &eframe::CreationContext<'_>, f: impl FnOnce() -> Runtime<Sim<()>>) -> Self {
-        let subscriber = tracing_subscriber::fmt().with_ansi(false);
-        let subscriber = subscriber.event_format(MachineReadableFormat);
-        let subscriber = subscriber.with_env_filter(
-            EnvFilter::builder()
-                .with_default_directive(Directive::from(FALLBACK_LOG_LEVEL))
-                .from_env_lossy(),
-        );
-        let buf = MakeTracer::new();
-        let subscriber = subscriber.with_writer(buf.clone());
-        subscriber.finish().init();
+    pub fn new(cc: &eframe::CreationContext<'_>, f: impl FnOnce() -> Runtime<Sim<()>>) -> Self {
+        let gui_capture = GuiTracingObserver::default();
+        let stdout = std::io::stdout;
+        let subscriber = tracing_subscriber::Registry::default()
+            .with(
+                EnvFilter::builder()
+                    .with_default_directive(Directive::from(FALLBACK_LOG_LEVEL))
+                    .from_env_lossy(),
+            )
+            .with(
+                Layer::default()
+                    .with_ansi(false)
+                    .event_format(gui_capture.clone()),
+            )
+            .with(
+                Layer::default()
+                    .with_writer(stdout)
+                    .with_ansi(true)
+                    .event_format(des::tracing::format()),
+            );
+
+        ::tracing::subscriber::set_global_default(subscriber).unwrap();
+
+        egui_extras::install_image_loaders(&cc.egui_ctx);
 
         // This is also where you can customize the look and feel of egui using
         // `cc.egui_ctx.set_visuals` and `cc.egui_ctx.set_fonts`.
@@ -107,7 +135,7 @@ impl Application {
         // Note that you must enable the `persistence` feature for this to work.
 
         let runtime = f();
-        let topo = runtime.app.topology();
+        // let topo = runtime.app.topology();
 
         Self {
             last_frame: Instant::now(),
@@ -117,11 +145,15 @@ impl Application {
                 pre_frame_limit: Speed::Slow,
             },
             rt: Rt::Runtime(runtime),
-            logs: buf,
+            logs: gui_capture,
 
-            graph: generate_graph(topo),
+            dir: temp_dir(),
+
+            // graph: generate_graph(topo),
             modals: Vec::new(),
             traces: vec![Vec::new()],
+
+            enable_graph: false,
         }
     }
 
@@ -160,9 +192,46 @@ impl Application {
                             }
                         });
 
-                    ui.with_layout(Layout::centered_and_justified(Direction::TopDown), |ui| {
-                        ui.label(format!("{:?} | {}", time, itr,));
-                    });
+                    if ui.button("Toggle Graph").clicked() {
+                        if self.enable_graph {
+                            self.enable_graph = false;
+                        } else {
+                            let topo = sim.topology();
+
+                            let mut child = Command::new("dot")
+                                .arg("-Tpng")
+                                .arg("-Gdpi=300")
+                                .arg("-Gfontcolor=white")
+                                .arg("-Gcolor=white")
+                                .arg("-Nfontcolor=white")
+                                .arg("-Ncolor=white")
+                                .arg("-Efontcolor=white")
+                                .arg("-Ecolor=white")
+                                .arg("-Gbgcolor=black")
+                                .stdin(Stdio::piped())
+                                .stdout(Stdio::piped())
+                                .spawn()
+                                .expect("dot failed");
+
+                            let mut stdin = child.stdin.take().expect("failed to open stdin");
+                            stdin
+                                .write_all(topo.as_dot().as_bytes())
+                                .expect("write failed");
+                            drop(stdin);
+
+                            let output = child.wait_with_output().expect("wait failed");
+                            File::create(format!("{}topo.png", self.dir.as_path().display()))
+                                .unwrap()
+                                .write_all(&output.stdout)
+                                .unwrap();
+
+                            ::tracing::info!(
+                                "wrote topo to {}",
+                                format!("{}topo.png", self.dir.as_path().display())
+                            );
+                            self.enable_graph = true;
+                        }
+                    }
 
                     ui.with_layout(Layout::right_to_left(Align::TOP), |ui| {
                         if ui
@@ -205,6 +274,8 @@ impl Application {
                                     "Fast",
                                 );
                             });
+
+                        ui.label(format!("{:?} | {}", time, itr,));
                     })
                 });
             });
@@ -235,7 +306,6 @@ impl eframe::App for Application {
                     runtime.start();
                 }
 
-                info!("executing {steps} events");
                 runtime.dispatch_n_events(steps);
 
                 self.traces
@@ -244,7 +314,6 @@ impl eframe::App for Application {
 
                 if let Some(ref mut limit) = self.param.limit {
                     *limit = limit.saturating_sub(steps);
-                    info!("remaining {} events after - {steps}", *limit);
                 }
             }
         };
@@ -253,11 +322,19 @@ impl eframe::App for Application {
 
         self.modals.retain(|v| !v.remove);
         for modal in &mut self.modals {
-            SidePanel::new(
-                egui::panel::Side::Left,
-                format!("panel-{}", modal.module.path()),
-            )
-            .show(ctx, |ui| modal.show(ui, &mut self.traces));
+            ctx.show_viewport_immediate(
+                egui::ViewportId(Id::new(format!("panel-{}", modal.module.path()))),
+                ViewportBuilder::default()
+                    .with_title(modal.module.path().to_string())
+                    .with_inner_size([500.0, 1200.0]),
+                |ctx, _| {
+                    CentralPanel::default().show(ctx, |ui| modal.show(ui, &mut self.traces));
+                    if ctx.input(|i| i.viewport().close_requested()) {
+                        // Tell parent to close us.
+                        modal.remove = true;
+                    }
+                },
+            );
         }
 
         if self.traces.iter().map(Vec::len).sum::<usize>() > 0 {
@@ -274,7 +351,7 @@ impl eframe::App for Application {
         let style_settings = &SettingsStyle::new().with_labels_always(true);
         let navigation_settings = &SettingsNavigation::new()
             .with_fit_to_screen_enabled(true)
-            .with_zoom_and_pan_enabled(false);
+            .with_zoom_and_pan_enabled(true);
 
         egui::CentralPanel::default().show(ctx, |ui| {
             // ui.add(
@@ -285,6 +362,14 @@ impl eframe::App for Application {
             //     .with_interactions(interaction_settings)
             //     .with_navigations(navigation_settings),
             // );
+            //
+
+            if self.enable_graph {
+                ui.add(
+                    Image::new(format!("file://{}topo.png", self.dir.as_path().display()))
+                        .shrink_to_fit(),
+                );
+            }
         });
 
         let frame_time = Duration::from_secs(1) / 30;
