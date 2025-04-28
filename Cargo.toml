@@ -16,6 +16,9 @@ serde = { version = "1.0.219", features = ["derive"] }
 serde_yml = "*"
 tracing = { version = "0.1.41", features = ["log"] }
 tracing-subscriber = { version = "0.3.19", features = ["env-filter"] }
+valuable = { git = "https://github.com/PetrichorIT/valuable", branch = "owned", features = [
+    "derive",
+] }
 
 [patch.crates-io]
 des = { path = "../des/des" }

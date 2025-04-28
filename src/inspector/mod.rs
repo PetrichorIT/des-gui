@@ -1,24 +1,21 @@
-use std::borrow::Cow;
+use std::{borrow::Cow, sync::mpsc::Sender};
 
-use des::{net::module::RawProp, prelude::ModuleRef};
+use des::net::ObjectPath;
 
-use egui::{CollapsingHeader, Color32, Frame, Label, RichText, TextEdit, TextStyle};
+use egui::{
+    Button, CollapsingHeader, Color32, Frame, Label, RichText, Sense, TextEdit, TextStyle,
+    collapsing_header::CollapsingState,
+};
 use egui_extras::{Column, TableBuilder};
 use fxhash::FxHashMap;
 use serde_yml::{Mapping, Value};
 use tracing::Level;
 
-use crate::{
-    plot::{PropTracer, Tracer},
-    tracing::GuiTracingObserver,
-};
-
-mod props;
-pub use props::*;
+use crate::{ActionReq, tracing::GuiTracingObserver};
 
 #[derive(Debug, Clone)]
 pub struct ModuleInspector {
-    pub module: ModuleRef,
+    pub path: ObjectPath,
     pub filter: String,
     pub logs: GuiTracingObserver,
     pub remove: bool,
@@ -26,14 +23,14 @@ pub struct ModuleInspector {
 
 impl PartialEq for ModuleInspector {
     fn eq(&self, other: &Self) -> bool {
-        self.module == other.module
+        self.path == other.path
     }
 }
 
 impl ModuleInspector {
-    pub const fn new(module: ModuleRef, logs: GuiTracingObserver) -> Self {
+    pub const fn new(module: ObjectPath, logs: GuiTracingObserver) -> Self {
         Self {
-            module,
+            path: module,
             filter: String::new(),
             logs,
             remove: false,
@@ -42,7 +39,7 @@ impl ModuleInspector {
 }
 
 impl ModuleInspector {
-    pub fn show(&mut self, ui: &mut egui::Ui, tracers: &mut Vec<Vec<Box<dyn Tracer>>>) {
+    pub fn show(&mut self, ui: &mut egui::Ui, value: Value, tx: Sender<ActionReq>) {
         Frame::new().show(ui, |ui| {
             TextEdit::singleline(&mut self.filter)
                 .background_color(Color32::DARK_GRAY)
@@ -52,42 +49,11 @@ impl ModuleInspector {
 
             ui.separator();
 
-            let props = self.module.props();
-            let props_with_values = props
-                .iter()
-                .filter_map(|key| {
-                    let prop = self.module.prop_raw(&key);
-                    if let Some(value) = prop.into_value() {
-                        Some((&key[..], Cow::<Value>::Owned(value)))
-                    } else {
-                        None
-                    }
-                })
-                .collect::<Vec<_>>();
-
-            let map = unify(&props_with_values);
-
-            let props = self
-                .module
-                .props()
-                .into_iter()
-                .filter_map(|key| {
-                    let prop = self.module.prop_raw(&key);
-                    if let Some(_) = prop.into_value() {
-                        Some((key, prop))
-                    } else {
-                        None
-                    }
-                })
-                .collect::<Vec<_>>();
-
-            value_to_collapsable(
+            display_value_root(
                 ui,
-                &mut tracers[0],
-                String::new(),
-                String::new(),
-                &Value::Mapping(map),
-                &props,
+                &self.path,
+                &tx,
+                value.as_mapping().expect("must be a mapping"),
             );
 
             ui.separator();
@@ -95,7 +61,7 @@ impl ModuleInspector {
             let row_height = ui.text_style_height(&TextStyle::Body);
 
             let stream = self.logs.streams.lock().unwrap();
-            if let Some(events) = stream.get(&self.module.path()) {
+            if let Some(events) = stream.get(&self.path) {
                 let matching_events = events
                     .iter()
                     .filter(|v| v.matches(&self.filter))
@@ -178,7 +144,10 @@ pub fn unify(props: &[(&str, Cow<Value>)]) -> Mapping {
         if submapping.len() == 1 {
             let (k, v) = submapping.map.into_iter().next().expect("must exist");
             let k = k.as_str().expect("must be a string");
-            mapping.insert(Value::String(format!("{group}.{k}")), v);
+            mapping.insert(
+                Value::String(format!("{group}.{k}").trim_matches('.').to_string()),
+                v,
+            );
         } else {
             mapping.insert(Value::String(group.to_string()), Value::Mapping(submapping));
         }
@@ -187,166 +156,200 @@ pub fn unify(props: &[(&str, Cow<Value>)]) -> Mapping {
     mapping
 }
 
-fn simplify(mapping: &mut Mapping) {
-    let keys = mapping
-        .keys()
-        .map(|k| {
-            k.as_str()
-                .unwrap()
-                .split_once('.')
-                .unwrap_or((k.as_str().unwrap(), ""))
-        })
-        .collect::<Vec<_>>();
-
-    let mut map = FxHashMap::<String, Vec<String>>::default();
-    for (mtch, rem) in &keys {
-        map.entry(mtch.to_string())
-            .or_default()
-            .push(rem.to_string());
-    }
-
-    for (group, members) in map {
-        if members.len() == 1 {
-            continue;
-        }
-
-        let mut submapping = Mapping::new();
-        for member in members {
-            if member.is_empty() {
-                let val = mapping.remove(&group).unwrap();
-                let map = val.as_mapping().expect("must be a map");
-                for (k, v) in map {
-                    submapping.insert(k.clone(), v.clone());
+pub fn remove_empty(mapping: &mut Mapping) {
+    for k in mapping.keys().cloned().collect::<Vec<_>>() {
+        let value = mapping.get_mut(&k).expect("must exist");
+        match value {
+            Value::Mapping(map) => {
+                remove_empty(map);
+                if map.is_empty() {
+                    mapping.remove(k);
                 }
-            } else {
-                submapping.insert(
-                    Value::String(member.to_string()),
-                    mapping
-                        .remove(Value::String(format!("{group}.{member}")))
-                        .unwrap(),
-                );
             }
-        }
-
-        simplify(&mut submapping);
-
-        if submapping.len() == 1 {
-            let key = submapping
-                .keys()
-                .next()
-                .unwrap()
-                .clone()
-                .as_str()
-                .unwrap()
-                .to_string();
-            let value = submapping.remove(&key).unwrap();
-            mapping.insert(Value::String(format!("{group}.{key}")), value);
-        } else {
-            mapping.insert(Value::String(group), Value::Mapping(submapping));
+            Value::Sequence(seq) if seq.is_empty() => {
+                mapping.remove(k);
+            }
+            _ => {}
         }
     }
 }
 
-fn value_to_collapsable(
+pub fn display_value_root(
     ui: &mut egui::Ui,
-    tracers: &mut Vec<Box<dyn Tracer>>,
+    module: &ObjectPath,
+    tracers: &Sender<ActionReq>,
+    mapping: &Mapping,
+) {
+    for (k, v) in mapping {
+        let k = k.as_str().expect("must be a string").to_string();
+        display_value(ui, module, Some(tracers), k.clone(), k.clone(), v);
+    }
+}
+
+pub fn display_value(
+    ui: &mut egui::Ui,
+    module: &ObjectPath,
+    actions: Option<&Sender<ActionReq>>,
     global_key: String,
     key: String,
     value: &Value,
-    props: &[(String, RawProp)],
 ) {
     match value {
         Value::Sequence(seq) => {
             CollapsingHeader::new(&key).show(ui, |ui| {
                 for (i, value) in seq.iter().enumerate() {
-                    // TODO invalidate global key
-                    value_to_collapsable(
+                    display_value(
                         ui,
-                        tracers,
+                        module,
+                        actions,
                         format!("{global_key}.{i}"),
-                        String::new(),
+                        i.to_string(),
                         value,
-                        props,
                     );
+                    if i != seq.len() - 1 {
+                        ui.separator();
+                    }
                 }
             });
         }
         Value::Mapping(mapping) => {
-            if !key.is_empty() {
-                CollapsingHeader::new(key)
-                    .id_salt(&global_key)
-                    .show(ui, |ui| {
-                        for (key, value) in mapping {
-                            let key = key.as_str().unwrap().to_string();
-                            value_to_collapsable(
-                                ui,
-                                tracers,
-                                format!("{global_key}.{key}"),
-                                key,
-                                value,
-                                props,
-                            );
-                        }
-                    });
-            } else {
-                for (key, value) in mapping {
-                    let key = key.as_str().unwrap().to_string();
-                    value_to_collapsable(
-                        ui,
-                        tracers,
-                        format!("{global_key}.{key}"),
-                        key,
-                        value,
-                        props,
-                    );
-                }
-            }
+            ui.horizontal(|ui| {
+                let id = ui.make_persistent_id(&global_key);
+                ui.vertical(|ui| {
+                    let mut state = CollapsingState::load_with_default_open(ui.ctx(), id, false);
+                    let id_toggle = ui.make_persistent_id((id, "toggle"));
+
+                    let should_toggle: bool =
+                        ui.memory_mut(|m| m.data.get_temp(id_toggle).unwrap_or_default());
+
+                    if should_toggle {
+                        state.toggle(ui);
+                        ui.memory_mut(|m| {
+                            let should_toggle = m.data.get_temp_mut_or_default::<bool>(id_toggle);
+                            *should_toggle = false;
+                        });
+                    }
+
+                    state
+                        .show_header(ui, |ui| {
+                            let resp = ui.vertical(|ui| ui.label(key));
+                            let id_interact = ui.make_persistent_id((id, "interact"));
+                            if ui
+                                .interact(resp.response.rect, id_interact, Sense::click())
+                                .clicked()
+                            {
+                                ui.memory_mut(|m| {
+                                    let should_toggle =
+                                        m.data.get_temp_mut_or_default::<bool>(id_toggle);
+                                    *should_toggle = true;
+                                });
+                            }
+
+                            if let Some(actions) = actions {
+                                let btn = Button::image(egui::Image::new(egui::include_image!(
+                                    "../../assets/breakpoint.png"
+                                )))
+                                .corner_radius(5.0)
+                                .frame(false);
+
+                                if ui.add(btn).clicked() {
+                                    actions
+                                        .send(ActionReq::Breakpoint((
+                                            module.clone(),
+                                            global_key.trim_matches('.').to_string(),
+                                            Some(value.clone()),
+                                        )))
+                                        .expect("failed to send");
+                                }
+                            }
+                        })
+                        .body(|ui| {
+                            for (key, value) in mapping {
+                                let key = key.as_str().unwrap().to_string();
+                                display_value(
+                                    ui,
+                                    module,
+                                    actions,
+                                    format!("{global_key}.{key}"),
+                                    key,
+                                    value,
+                                );
+                            }
+                        });
+                });
+            });
         }
 
         Value::Tagged(tagged) => {
             ui.horizontal(|ui| {
-                ui.label(key);
-                CollapsingHeader::new(&tagged.tag.string)
-                    .id_salt(&global_key)
-                    .show(ui, |ui| {
-                        value_to_collapsable(
-                            ui,
-                            tracers,
-                            global_key,
-                            String::new(),
-                            &tagged.value,
-                            props,
-                        )
-                    });
+                display_value(
+                    ui,
+                    module,
+                    actions,
+                    global_key,
+                    format!("{key} ({})", tagged.tag.string),
+                    &tagged.value,
+                )
             });
         }
 
         _ => {
             ui.horizontal(|ui| {
                 ui.label(key);
-                value_to_label(ui, value);
-                if let Some((prop_key, prop)) = props
-                    .iter()
-                    .find(|v| v.0 == global_key.trim_start_matches('.'))
-                {
-                    if ui.button("Observe").clicked() {
-                        tracers.push(Box::new(PropTracer::new(prop_key.clone(), prop.clone())));
-                    }
-                }
+                value_to_label(ui, value, module, global_key, actions);
             });
         }
     }
 }
 
-fn value_to_label(ui: &mut egui::Ui, value: &Value) {
-    match value {
-        Value::String(s) => ui.label(s),
-        Value::Number(n) => ui.label(n.to_string()),
-        Value::Null => ui.label("null"),
-        Value::Bool(b) => ui.label(b.to_string()),
-        Value::Sequence(seq) if seq.is_empty() => ui.label("[]"),
-        _ => ui.label(format!("??? ({value:?})")),
-    };
+pub fn value_to_label(
+    ui: &mut egui::Ui,
+    value: &Value,
+    module: &ObjectPath,
+    global_key: String,
+    actions: Option<&Sender<ActionReq>>,
+) {
+    ui.horizontal(|ui| {
+        match value {
+            Value::String(s) => ui.label(s),
+            Value::Number(n) => {
+                ui.label(n.to_string());
+                if let Some(actions) = actions {
+                    if ui.button("Observe").clicked() {
+                        actions
+                            .send(ActionReq::Trace((
+                                module.clone(),
+                                global_key.trim_matches('.').to_string(),
+                            )))
+                            .expect("failed to send");
+                    }
+                }
+                ui.response()
+            }
+            Value::Null => ui.label("null"),
+            Value::Bool(b) => ui.label(b.to_string()),
+            Value::Sequence(seq) if seq.is_empty() => ui.label("[]"),
+            _ => ui.label(format!("??? ({value:?})")),
+        };
+
+        if let Some(actions) = actions {
+            let btn = Button::image(egui::Image::new(egui::include_image!(
+                "../../assets/breakpoint.png"
+            )))
+            .corner_radius(5.0)
+            .frame(false);
+
+            if ui.add(btn).clicked() {
+                actions
+                    .send(ActionReq::Breakpoint((
+                        module.clone(),
+                        global_key.trim_matches('.').to_string(),
+                        Some(value.clone()),
+                    )))
+                    .expect("failed to send");
+            }
+        }
+    });
 }
 
 fn color_for_log(level: Level) -> Color32 {

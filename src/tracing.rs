@@ -1,9 +1,4 @@
-use std::{
-    fmt::Display,
-    ops::{Deref, DerefMut},
-    str::FromStr,
-    sync::{Arc, Mutex},
-};
+use std::sync::{Arc, Mutex};
 
 use des::{
     net::{ObjectPath, module::try_current},
@@ -16,51 +11,6 @@ use tracing_subscriber::{
     fmt::{FormatEvent, FormatFields, FormattedFields, format::Writer},
     registry::LookupSpan,
 };
-
-#[derive(Debug, Clone)]
-#[repr(transparent)]
-pub struct StringEncoded<T>(pub T);
-
-impl<T> Deref for StringEncoded<T> {
-    type Target = T;
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
-impl<T> DerefMut for StringEncoded<T> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.0
-    }
-}
-
-impl<T> Serialize for StringEncoded<T>
-where
-    T: Display,
-{
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        serializer.serialize_str(&self.0.to_string())
-    }
-}
-
-impl<'de, T> Deserialize<'de> for StringEncoded<T>
-where
-    T: FromStr,
-    T::Err: Display,
-{
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        let s = String::deserialize(deserializer)?;
-        T::from_str(&s)
-            .map(StringEncoded)
-            .map_err(serde::de::Error::custom)
-    }
-}
 
 #[derive(Debug, Clone)]
 pub struct Event {
@@ -132,6 +82,15 @@ where
 
         let mut buf_writer = Writer::new(&mut json.fields);
         ctx.format_fields(buf_writer.by_ref(), event)?;
+
+        // manual fields
+        // let mut visitor = FieldVisitor {
+        //     message: RichText::new(""),
+        //     records: Vec::new(),
+        // };
+
+        // event.record(&mut visitor);
+        // dbg!(visitor);
 
         let mut streams = self.streams.lock().expect("failed to lock");
         streams.entry(json.module.clone()).or_default().push(json);

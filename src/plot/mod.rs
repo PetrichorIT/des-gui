@@ -1,6 +1,7 @@
-use des::{net::module::RawProp, time::SimTime};
+use des::{net::ObjectPath, time::SimTime};
 use egui::{Context, ScrollArea, SidePanel, panel::Side};
 use egui_plot::{Legend, Line, Plot, PlotPoint, PlotPoints};
+use fxhash::FxHashMap;
 use serde_yml::Value;
 
 use crate::Application;
@@ -49,36 +50,40 @@ impl Application {
 
 pub trait Tracer {
     fn name(&self) -> String;
-    fn update(&mut self);
+    fn needs_path(&self, path: &ObjectPath) -> bool;
+    fn update(&mut self, values: &FxHashMap<ObjectPath, Value>);
     fn points(&self) -> PlotPoints<'_>;
 }
 
-pub struct PropTracer {
+pub struct TreeTracer {
+    path: ObjectPath,
     key: String,
-    prop: RawProp,
     values: Vec<PlotPoint>,
 }
 
-impl PropTracer {
-    pub const fn new(key: String, prop: RawProp) -> Self {
+impl TreeTracer {
+    pub fn new(module: ObjectPath, key: String) -> Self {
         Self {
+            path: module,
             key,
-            prop,
             values: Vec::new(),
         }
     }
 }
 
-impl Tracer for PropTracer {
+impl Tracer for TreeTracer {
     fn name(&self) -> String {
-        self.key.clone()
+        format!("{} {}", self.path, self.key)
     }
 
-    fn update(&mut self) {
-        if let Some(y) = self.prop.into_value().and_then(|value| match value {
-            Value::Number(n) => n.as_f64(),
-            _ => None,
-        }) {
+    fn needs_path(&self, path: &ObjectPath) -> bool {
+        self.path == *path
+    }
+
+    fn update(&mut self, values: &FxHashMap<ObjectPath, Value>) {
+        let map = values.get(&self.path).expect("message not observed");
+
+        if let Some(y) = access(map, &self.key).and_then(|v| v.as_f64()) {
             let x = SimTime::now().as_secs_f64();
             if let Some(last_y) = self.values.last().map(|p| p.y) {
                 if last_y != y {
@@ -93,5 +98,68 @@ impl Tracer for PropTracer {
 
     fn points(&self) -> PlotPoints<'_> {
         PlotPoints::Borrowed(&self.values)
+    }
+}
+
+pub fn access(value: &Value, key: &str) -> Option<Value> {
+    match value {
+        other if key.is_empty() => Some(other.clone()),
+        Value::Mapping(map) => {
+            let mut include = key.len();
+            while include > 0 {
+                // TODO: This shit is still buggy
+                let pos = key[..include].rfind('.').unwrap_or(include);
+                let subkey = &key[..pos];
+                if let Some(val) = map.get(subkey) {
+                    return access(val, &key[(pos + 1).min(key.len())..]);
+                }
+                include = pos - 1;
+            }
+
+            // try full key
+            if let Some(val) = map.get(key) {
+                return access(val, "");
+            }
+
+            None
+        }
+        Value::Sequence(seq) => {
+            let (index, rem) = key.split_once('.').unwrap_or((key, ""));
+            let index = index.parse::<usize>().ok()?;
+            let element = seq.get(index)?;
+            access(element, rem)
+        }
+
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_yml::{Mapping, Sequence};
+
+    use super::*;
+
+    #[test]
+    fn access_multi_keys() {
+        let value = Value::Mapping(Mapping::from_iter([(
+            Value::String("inet".to_string()),
+            Value::Mapping(Mapping::from_iter([(
+                Value::String("v6.solicitations".to_string()),
+                Value::Sequence(Sequence::from_iter([
+                    Value::String("a".to_string()),
+                    Value::String("b".to_string()),
+                ])),
+            )])),
+        )]));
+
+        let result = access(&value, "inet.v6.solicitations");
+        assert_eq!(
+            result,
+            Some(Value::Sequence(Sequence::from_iter([
+                Value::String("a".to_string()),
+                Value::String("b".to_string()),
+            ])))
+        );
     }
 }

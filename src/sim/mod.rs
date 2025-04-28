@@ -1,5 +1,5 @@
 use des::{
-    net::{HandlerFn, ModuleFn},
+    net::blocks::{HandlerFn, ModuleFn},
     prelude::*,
 };
 use tracing::info_span;
@@ -13,7 +13,7 @@ pub fn sim() -> Runtime<Sim<()>> {
             |state, _| {
                 *state += 1;
                 info_span!("pinger", state).in_scope(|| {
-                    tracing::info!("PONG");
+                    tracing::info!(%state, "PONG");
                     current().prop::<usize>("counter").unwrap().set(*state);
                     current()
                         .prop::<String>("key")
