@@ -5,7 +5,10 @@ use des::{
     time::SimTime,
 };
 use egui::ahash::HashMap;
-use serde::{Deserialize, Serialize};
+use serde::{
+    Deserialize, Serialize,
+    ser::{SerializeMap, SerializeStruct},
+};
 use tracing::{Metadata, Subscriber};
 use tracing_subscriber::{
     fmt::{FormatEvent, FormatFields, FormattedFields, format::Writer},
@@ -19,6 +22,37 @@ pub struct Event {
     pub module: ObjectPath,
     pub span: String,
     pub fields: String,
+}
+
+impl Serialize for Event {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let mut struc = serializer.serialize_struct("Event", 5)?;
+        struc.serialize_field("time", &self.time)?;
+        struc.serialize_field("module", &self.module.as_str())?;
+        struc.serialize_field("metadata", &SerFieldSet(self.metadata))?;
+        struc.serialize_field("span", &self.span)?;
+        struc.serialize_field("fields", &self.fields)?;
+
+        struc.end()
+    }
+}
+
+struct SerFieldSet(&'static Metadata<'static>);
+
+impl Serialize for SerFieldSet {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let mut struc = serializer.serialize_map(None)?;
+        struc.serialize_entry("target", &self.0.target())?;
+        struc.serialize_entry("file", &self.0.file())?;
+        struc.serialize_entry("level", &self.0.level().as_str())?;
+        struc.end()
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -37,7 +71,7 @@ impl Event {
 
 #[derive(Debug, Clone, Default)]
 pub struct GuiTracingObserver {
-    pub streams: Arc<Mutex<HashMap<ObjectPath, Vec<Event>>>>,
+    pub streams: Arc<Mutex<HashMap<ObjectPath, ModuleLog>>>,
 }
 
 impl<S, N> FormatEvent<S, N> for GuiTracingObserver
@@ -83,18 +117,30 @@ where
         let mut buf_writer = Writer::new(&mut json.fields);
         ctx.format_fields(buf_writer.by_ref(), event)?;
 
-        // manual fields
-        // let mut visitor = FieldVisitor {
-        //     message: RichText::new(""),
-        //     records: Vec::new(),
-        // };
-
-        // event.record(&mut visitor);
-        // dbg!(visitor);
-
         let mut streams = self.streams.lock().expect("failed to lock");
         streams.entry(json.module.clone()).or_default().push(json);
 
         Ok(())
+    }
+}
+
+/// The totality of logs for a given module.
+///
+/// desired output:
+///
+/// [t0 ... t1] span, span, span
+///  [t0] target message values
+#[derive(Debug, Default)]
+pub struct ModuleLog {
+    events: Vec<Event>,
+}
+
+impl ModuleLog {
+    pub fn output(&self) -> &[Event] {
+        &self.events
+    }
+
+    pub fn push(&mut self, event: Event) {
+        self.events.push(event.clone());
     }
 }

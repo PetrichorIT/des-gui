@@ -4,21 +4,22 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-des = { path = "../des/des", features = ["full"] }
-eframe = { version = "*", features = ["persistence"] }
+des = { version = "*", features = ["full", "serde"] }
+eframe = { version = "0.31", features = ["persistence"] }
 egui = "0.31"
 egui_extras = { version = "0.31.1", features = ["all_loaders"] }
-egui_graphs = "0.25.0"
 egui_plot = "0.31.0"
 fxhash = "0.2.1"
-petgraph = "0.7"
 serde = { version = "1.0.219", features = ["derive"] }
-serde_yml = "*"
+serde_norway = "*"
 tracing = { version = "0.1.41", features = ["log"] }
 tracing-subscriber = { version = "0.3.19", features = ["env-filter"] }
-valuable = { git = "https://github.com/PetrichorIT/valuable", branch = "owned", features = [
-    "derive",
-] }
+
+serde-value = { path = "../serde-value" }
+petgraph = "0.8.3"
+tracing-error = "0.2.1"
+tracing-forest = "0.3.0"
+egui-file-dialog = "0.12.0"
 
 [patch.crates-io]
-des = { path = "../des/des" }
+des = { git = "https://github.com/PetrichorIT/des", branch = "v6.3" }

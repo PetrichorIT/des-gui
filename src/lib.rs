@@ -1,13 +1,16 @@
 use breakpoint::{Breakpoint, BreakpointKind};
-use des::{prelude::*, tracing::FALLBACK_LOG_LEVEL};
-use egui::{CentralPanel, Id, Image, ViewportBuilder};
+use des::{prelude::*, runtime::RuntimeResult, tracing::FALLBACK_LOG_LEVEL};
+use egui::{
+    CentralPanel, CollapsingHeader, Id, Image, RichText, ScrollArea, SidePanel, ViewportBuilder,
+};
 use fxhash::FxHashMap;
+use petgraph::dot::{Config, Dot};
 use plot::{Tracer, TreeTracer};
-use serde_yml::{Mapping, Value};
+use serde_norway::{Mapping, Value};
 use std::{
     borrow::Cow,
-    env::temp_dir,
-    fs::File,
+    env::{self, temp_dir},
+    fs::{self, File},
     io::Write,
     mem::{self, forget},
     ops::{ControlFlow, Deref, DerefMut},
@@ -16,8 +19,13 @@ use std::{
     sync::mpsc::{Receiver, Sender, channel},
     time::{Duration, Instant},
 };
-use tracing_subscriber::{EnvFilter, filter::Directive, fmt::Layer, layer::SubscriberExt};
-use valuable::ValueOwned;
+use tracing_error::ErrorLayer;
+use tracing_subscriber::{
+    EnvFilter,
+    filter::Directive,
+    fmt::{Layer, format},
+    layer::SubscriberExt,
+};
 
 pub mod sim;
 pub mod tracing;
@@ -71,7 +79,12 @@ pub struct Application {
     // helpers
     tx_rx: (Sender<ActionReq>, Receiver<ActionReq>),
 
-    enable_graph: bool,
+    frame_time: Duration,
+
+    show_module_selection: bool,
+    show_breakpoints: bool,
+    show_graph: bool,
+    show_errors: bool,
 }
 
 #[derive(Debug, Default)]
@@ -82,7 +95,7 @@ struct Observer {
 impl Observer {
     fn update(&mut self, sim: &Sim<()>) {
         for (path, value) in &mut self.map {
-            let Ok(module) = sim.globals().node(path.clone()) else {
+            let Some(module) = sim.globals().get(&path) else {
                 continue;
             };
 
@@ -107,19 +120,29 @@ impl DerefMut for Observer {
 
 enum Rt {
     Runtime(Runtime<Sim<()>>),
-    Finished(Sim<()>, SimTime, usize),
+    Finished(RuntimeResult<Sim<()>>),
 }
 
 impl Rt {
-    fn finish(&mut self) -> Result<(), RuntimeError> {
+    fn sim(&self) -> &Sim<()> {
+        match self {
+            Self::Runtime(rt) => &rt.app,
+            Self::Finished(res) => &res.app,
+        }
+    }
+
+    fn finish(&mut self) -> Result<(), des::net::Error> {
         match self {
             Self::Runtime(rt) => {
                 unsafe {
                     let runtime = std::ptr::read(rt);
-                    let replacing = runtime
-                        .finish()
-                        .map(|(s, t, p)| Rt::Finished(s, t, p.event_count))?;
+                    let replacing = runtime.finish();
 
+                    if let Some(err) = &replacing.error {
+                        println!("{err}");
+                    }
+
+                    let replacing = Rt::Finished(replacing);
                     let zeroed = mem::replace(self, replacing);
                     forget(zeroed);
                 };
@@ -139,6 +162,12 @@ pub struct ExecutionParameters {
 impl Application {
     /// Called once before the first frame.
     pub fn new(cc: &eframe::CreationContext<'_>, f: impl FnOnce() -> Runtime<Sim<()>>) -> Self {
+        if env::var("RUST_LOG").is_err() {
+            unsafe {
+                env::set_var("RUST_LOG", "winit=warn,trace");
+            }
+        }
+
         let gui_capture = GuiTracingObserver::default();
         let stdout = std::io::stdout;
         let subscriber = tracing_subscriber::Registry::default()
@@ -147,6 +176,7 @@ impl Application {
                     .with_default_directive(Directive::from(FALLBACK_LOG_LEVEL))
                     .from_env_lossy(),
             )
+            .with(ErrorLayer::default())
             .with(
                 Layer::default()
                     .with_ansi(false)
@@ -192,7 +222,12 @@ impl Application {
 
             tx_rx: channel(),
 
-            enable_graph: false,
+            frame_time: Duration::ZERO,
+
+            show_module_selection: true,
+            show_breakpoints: false,
+            show_graph: false,
+            show_errors: false,
         }
     }
 
@@ -201,6 +236,7 @@ impl Application {
         while let Ok(req) = self.tx_rx.1.try_recv() {
             match req {
                 ActionReq::Breakpoint(req) => {
+                    self.show_breakpoints = true;
                     if let Some(i) = self
                         .breakpoints
                         .iter()
@@ -214,6 +250,7 @@ impl Application {
                             kind: BreakpointKind::OnValueChanged,
                             last: req.2,
                             triggered: false,
+                            remove: false,
                         });
                     }
                 }
@@ -239,11 +276,13 @@ impl Application {
             if can_progress {
                 let steps = self.param.pre_frame_count as usize;
                 if !runtime.was_started() {
-                    runtime.start();
+                    runtime.start().expect("failed to start");
                 }
 
                 'outer: for _ in 0..steps {
-                    runtime.dispatch_n_events(1);
+                    runtime
+                        .dispatch_n_events(1)
+                        .expect("failed to dispatch events");
 
                     self.observe.update(&runtime.app);
 
@@ -276,7 +315,7 @@ fn load_props_value(module: ModuleRef) -> Mapping {
         .filter_map(|key| {
             let prop = module.prop_raw(&key);
             if let Some(value) = prop.as_value() {
-                Some((&key[..], Cow::<ValueOwned>::Owned(value)))
+                Some((&key[..], Cow::<Value>::Owned(value)))
             } else {
                 None
             }
@@ -291,6 +330,8 @@ fn load_props_value(module: ModuleRef) -> Mapping {
 impl eframe::App for Application {
     /// Called each time the UI needs repainting, which may be many times per second.
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        let t0 = Instant::now();
+
         // Put your widgets into a `SidePanel`, `TopBottomPanel`, `CentralPanel`, `Window` or `Area`.
         // For inspiration and more examples, go to https://emilk.github.io/egui
 
@@ -301,12 +342,14 @@ impl eframe::App for Application {
         self.render_controls(ctx);
 
         self.modals.retain(|v| !v.remove);
+        self.breakpoints.retain(|v| !v.remove);
+
         for modal in &mut self.modals {
             ctx.show_viewport_immediate(
                 egui::ViewportId(Id::new(format!("panel-{}", modal.path))),
                 ViewportBuilder::default()
                     .with_title(modal.path.to_string())
-                    .with_inner_size([500.0, 1200.0]),
+                    .with_inner_size([800.0, 1200.0]),
                 |ctx, _| {
                     let tx = self.tx_rx.0.clone();
                     CentralPanel::default().show(ctx, |ui| {
@@ -331,15 +374,68 @@ impl eframe::App for Application {
             self.show_plot(ctx);
         }
 
-        self.render_breakpoints(ctx);
+        if self.show_module_selection {
+            SidePanel::left("module-selection").show(ctx, |ui| {
+                let sim = match &self.rt {
+                    Rt::Runtime(r) => &r.app,
+                    Rt::Finished(r) => &r.app,
+                };
+
+                ui.label(RichText::new("Breakpoints").strong());
+                ui.separator();
+
+                ScrollArea::vertical().show(ui, |ui| {
+                    for node_path in sim.nodes() {
+                        ui.scope(|ui| {
+                            let node = sim.globals().get(&node_path).expect("node must exist");
+                            let exists = self.modals.iter().any(|n| n.path == node.path());
+
+                            if exists {
+                                ui.disable();
+                            }
+                            if ui.button(node_path.as_str()).clicked() {
+                                let value = load_props_value(node);
+                                self.observe
+                                    .insert(node_path.clone(), Value::Mapping(value));
+                                self.modals
+                                    .push(ModuleInspector::new(node_path, self.logs.clone()));
+                            }
+                        });
+                    }
+                });
+            });
+        }
+
+        if self.show_breakpoints {
+            self.render_breakpoints(ctx);
+        }
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            if self.enable_graph {
-                ui.add(
-                    Image::new(format!("file://{}topo.png", self.dir.as_path().display()))
-                        .shrink_to_fit(),
-                );
+            if self.show_errors
+                && let Rt::Finished(r) = &self.rt
+                && let Some(e) = r.error.as_ref()
+            {
+                for (i, part) in e.into_iter().enumerate() {
+                    let lines = part.repr.to_string();
+                    let first = lines.lines().next().unwrap();
+                    CollapsingHeader::new(format!("{i}: {}", first))
+                        .default_open(true)
+                        .show(ui, |ui| {
+                            ui.label(lines.trim_start_matches(first).trim_start_matches('\n'))
+                        });
+                }
             }
+
+            if self.show_graph {
+                let path = format!("{}topo.png", self.dir.as_path().display());
+                if !fs::exists(&path).unwrap() {
+                    generate_graph(self.rt.sim(), &self.dir);
+                }
+
+                ui.add(Image::new(format!("file://{path}")).shrink_to_fit());
+            }
+
+            ui.label(format!("{:?}", self.frame_time))
         });
 
         // Remove observers if no longer needed
@@ -361,6 +457,8 @@ impl eframe::App for Application {
 
             ctx.request_repaint_after(wait_time);
         }
+
+        self.frame_time = t0.elapsed();
     }
 }
 
@@ -382,9 +480,25 @@ fn generate_graph(sim: &Sim<()>, dir: &Path) {
         .spawn()
         .expect("dot failed");
 
+    let graph = topo.map(
+        |_, node| node.path().to_string(),
+        |_, edge| format!("{}*{}", edge.source.name(), edge.target.name()),
+    );
+    let dot = Dot::with_attr_getters(
+        &graph,
+        &[Config::NodeNoLabel, Config::EdgeNoLabel],
+        &|_, edge| {
+            let (l, r) = edge.weight().split_once("*").unwrap();
+            format!("headlabel={r:?} taillabel={l:?}")
+        },
+        &|_, node| format!("label={:?} shape=box", node.1),
+    );
+
+    println!("{dot}");
+
     let mut stdin = child.stdin.take().expect("failed to open stdin");
     stdin
-        .write_all(topo.as_dot().as_bytes())
+        .write_all(format!("{dot}").as_bytes())
         .expect("write failed");
     drop(stdin);
 

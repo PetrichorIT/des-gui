@@ -1,13 +1,12 @@
-use egui::{Align, Color32, ComboBox, Context, Layout, PopupCloseBehavior, Slider};
-use serde_yml::Value;
+use egui::{Align, Color32, Context, Layout, RichText, Slider};
 
-use crate::{Application, Rt, generate_graph, inspector::ModuleInspector, load_props_value};
+use crate::{Application, Rt};
 
 impl Application {
     pub fn render_controls(&mut self, ctx: &Context) {
-        let (time, itr, sim) = match &self.rt {
-            Rt::Runtime(r) => (r.sim_time(), r.num_events_dispatched(), &r.app),
-            Rt::Finished(sim, time, itr) => (*time, *itr, sim),
+        let (time, itr, _, has_err) = match &self.rt {
+            Rt::Runtime(r) => (r.sim_time(), r.num_events_dispatched(), &r.app, false),
+            Rt::Finished(r) => (r.time, r.profiler.event_count, &r.app, r.error.is_some()),
         };
 
         egui::TopBottomPanel::top("controls-panel")
@@ -18,38 +17,12 @@ impl Application {
                 egui::menu::bar(ui, |ui| {
                     // NOTE: no File->Quit on web pages!
 
-                    ComboBox::new("combo-box-inspector-select", "")
-                        .selected_text("Select a module")
-                        .close_behavior(PopupCloseBehavior::CloseOnClickOutside)
-                        .show_ui(ui, |ui| {
-                            for node_path in sim.nodes() {
-                                let node = sim
-                                    .globals()
-                                    .node(node_path.clone())
-                                    .expect("node must exist");
-
-                                if self.modals.iter().any(|n| n.path == node.path()) {
-                                    continue;
-                                }
-
-                                if ui.button(node_path.as_str()).clicked() {
-                                    let value = load_props_value(node);
-                                    self.observe
-                                        .insert(node_path.clone(), Value::Mapping(value));
-                                    self.modals
-                                        .push(ModuleInspector::new(node_path, self.logs.clone()));
-                                }
-                            }
-                        });
-
-                    if ui.button("Toggle Graph").clicked() {
-                        if self.enable_graph {
-                            self.enable_graph = false;
-                        } else {
-                            generate_graph(sim, self.dir.as_path());
-                            self.enable_graph = true;
-                        }
-                    }
+                    ui.horizontal(|ui| {
+                        ui.toggle_value(&mut self.show_module_selection, "Modules");
+                        ui.toggle_value(&mut self.show_breakpoints, "Breakpoints");
+                        ui.toggle_value(&mut self.show_graph, "Graph");
+                        ui.toggle_value(&mut self.show_errors, "Errors");
+                    });
 
                     ui.with_layout(Layout::right_to_left(Align::TOP), |ui| {
                         if ui
@@ -81,6 +54,14 @@ impl Application {
                         ui.add(slider);
 
                         ui.label(format!("{:?} | {}", time, itr,));
+                        if has_err {
+                            if ui
+                                .button(RichText::new("Some error has occured").color(Color32::RED))
+                                .clicked()
+                            {
+                                self.show_errors = !self.show_errors;
+                            }
+                        }
                     })
                 });
             });

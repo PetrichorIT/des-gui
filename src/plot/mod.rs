@@ -2,7 +2,7 @@ use des::{net::ObjectPath, time::SimTime};
 use egui::{Context, ScrollArea, SidePanel, panel::Side};
 use egui_plot::{Legend, Line, Plot, PlotPoint, PlotPoints};
 use fxhash::FxHashMap;
-use serde_yml::Value;
+use serde_norway::Value;
 
 use crate::Application;
 
@@ -136,7 +136,7 @@ pub fn access(value: &Value, key: &str) -> Option<Value> {
 
 #[cfg(test)]
 mod tests {
-    use serde_yml::{Mapping, Sequence};
+    use serde_norway::{Mapping, Sequence};
 
     use super::*;
 

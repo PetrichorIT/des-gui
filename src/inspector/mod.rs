@@ -1,4 +1,4 @@
-use std::{borrow::Cow, sync::mpsc::Sender};
+use std::{borrow::Cow, fs::File, io::BufWriter, sync::mpsc::Sender};
 
 use des::net::ObjectPath;
 
@@ -8,7 +8,7 @@ use egui::{
 };
 use egui_extras::{Column, TableBuilder};
 use fxhash::FxHashMap;
-use serde_yml::{Mapping, Value};
+use serde_norway::{Mapping, Value};
 use tracing::Level;
 
 use crate::{ActionReq, tracing::GuiTracingObserver};
@@ -17,6 +17,7 @@ use crate::{ActionReq, tracing::GuiTracingObserver};
 pub struct ModuleInspector {
     pub path: ObjectPath,
     pub filter: String,
+    pub highlight: Option<String>,
     pub logs: GuiTracingObserver,
     pub remove: bool,
 }
@@ -33,6 +34,7 @@ impl ModuleInspector {
             path: module,
             filter: String::new(),
             logs,
+            highlight: None,
             remove: false,
         }
     }
@@ -41,29 +43,53 @@ impl ModuleInspector {
 impl ModuleInspector {
     pub fn show(&mut self, ui: &mut egui::Ui, value: Value, tx: Sender<ActionReq>) {
         Frame::new().show(ui, |ui| {
-            TextEdit::singleline(&mut self.filter)
-                .background_color(Color32::DARK_GRAY)
-                .clip_text(true)
-                .hint_text("Search...")
-                .show(ui);
+            ui.horizontal(|ui| {
+                TextEdit::singleline(&mut self.filter)
+                    .background_color(Color32::from_black_alpha(0))
+                    .clip_text(true)
+                    .hint_text("Search...")
+                    .show(ui);
+
+                if ui.button("Export").clicked() {
+                    // Export logic
+                    let lock = self.logs.streams.lock().unwrap();
+                    let events = lock
+                        .get(&self.path)
+                        .unwrap()
+                        .output()
+                        .into_iter()
+                        .collect::<Vec<_>>();
+                    // Export events to file or clipboard
+                    let f = File::create(format!("{}.logs.yaml", self.path)).unwrap();
+                    let f = BufWriter::new(f);
+                    serde_norway::to_writer(f, &events).unwrap();
+                }
+            });
 
             ui.separator();
 
-            display_value_root(
-                ui,
-                &self.path,
-                &tx,
-                value.as_mapping().expect("must be a mapping"),
-            );
+            // println!("{value:?}");
+            ui.horizontal(|ui| {
+                display(
+                    ui,
+                    Ctx {
+                        node: &self.path,
+                        actions: Some(&tx),
+                    },
+                    &value,
+                    String::new(),
+                );
+            });
 
             ui.separator();
 
             let row_height = ui.text_style_height(&TextStyle::Body);
 
             let stream = self.logs.streams.lock().unwrap();
-            if let Some(events) = stream.get(&self.path) {
-                let matching_events = events
-                    .iter()
+            if let Some(log) = stream.get(&self.path) {
+                let matching_events = log
+                    .output()
+                    .into_iter()
                     .filter(|v| v.matches(&self.filter))
                     .collect::<Vec<_>>();
 
@@ -83,19 +109,44 @@ impl ModuleInspector {
                                 );
                             });
                             row.col(|ui| {
-                                ui.add(
-                                    Label::new(
-                                        RichText::new(event.metadata.target())
-                                            .text_style(TextStyle::Monospace)
-                                            .italics(),
-                                    )
-                                    .extend(),
-                                );
+                                let target = RichText::new(event.metadata.target())
+                                    .text_style(TextStyle::Monospace)
+                                    .italics();
+                                if Some(event.metadata.target())
+                                    == self.highlight.as_ref().map(String::as_str)
+                                {
+                                    let label = ui.add(
+                                        Label::new(target.background_color(Color32::YELLOW))
+                                            .extend(),
+                                    );
+
+                                    if label.double_clicked() {
+                                        self.filter = self.highlight.clone().unwrap();
+                                    } else if label.clicked() {
+                                        self.highlight = None;
+                                    }
+                                } else {
+                                    if ui.add(Label::new(target).extend()).clicked() {
+                                        self.highlight = Some(event.metadata.target().to_string());
+                                    }
+                                };
                             });
                             row.col(|ui| {
-                                ui.label(
-                                    RichText::new(&event.span).text_style(TextStyle::Monospace),
-                                );
+                                let span =
+                                    RichText::new(&event.span).text_style(TextStyle::Monospace);
+                                if Some(&event.span) == self.highlight.as_ref() {
+                                    let label = ui.label(span.background_color(Color32::YELLOW));
+
+                                    if label.double_clicked() {
+                                        self.filter = self.highlight.clone().unwrap();
+                                    } else if label.clicked() {
+                                        self.highlight = None;
+                                    }
+                                } else {
+                                    if ui.label(span).clicked() {
+                                        self.highlight = Some(event.span.clone());
+                                    }
+                                };
                             });
                             row.col(|ui| {
                                 ui.add(
@@ -142,7 +193,7 @@ pub fn unify(props: &[(&str, Cow<Value>)]) -> Mapping {
     for (group, members) in groups {
         let submapping = unify(&members);
         if submapping.len() == 1 {
-            let (k, v) = submapping.map.into_iter().next().expect("must exist");
+            let (k, v) = submapping.into_iter().next().expect("must exist");
             let k = k.as_str().expect("must be a string");
             mapping.insert(
                 Value::String(format!("{group}.{k}").trim_matches('.').to_string()),
@@ -174,182 +225,177 @@ pub fn remove_empty(mapping: &mut Mapping) {
     }
 }
 
-pub fn display_value_root(
-    ui: &mut egui::Ui,
-    module: &ObjectPath,
-    tracers: &Sender<ActionReq>,
-    mapping: &Mapping,
-) {
-    for (k, v) in mapping {
-        let k = k.as_str().expect("must be a string").to_string();
-        display_value(ui, module, Some(tracers), k.clone(), k.clone(), v);
+/// For recursive variants (Seq, Map) there are two layout options:
+///
+/// A) key: value / index: value
+/// OR
+/// B) key <collaps value> / index: <collapse value>
+///
+/// for non-recursive subtypes use A, assume all entries have the same layout
+enum LayoutConstraint {
+    Shallow,
+    Deep,
+}
+
+fn determine_layout_constraints(value: &Value) -> LayoutConstraint {
+    match value {
+        Value::Sequence(_) | Value::Mapping(_) | Value::Tagged(_) => LayoutConstraint::Deep,
+        _ => LayoutConstraint::Shallow,
     }
 }
 
-pub fn display_value(
-    ui: &mut egui::Ui,
-    module: &ObjectPath,
-    actions: Option<&Sender<ActionReq>>,
-    global_key: String,
-    key: String,
-    value: &Value,
-) {
+#[derive(Debug, Clone, Copy)]
+pub struct Ctx<'a> {
+    pub node: &'a ObjectPath,
+    pub actions: Option<&'a Sender<ActionReq>>,
+}
+
+pub fn display(ui: &mut egui::Ui, ctx: Ctx, value: &Value, key: String) {
     match value {
+        Value::Mapping(map) if map.is_empty() => {
+            ui.label("[:]");
+        }
+        Value::Mapping(map) => {
+            ui.vertical(|ui| {
+                for (k, v) in map {
+                    let layout = determine_layout_constraints(v);
+                    let k = k.as_str().unwrap();
+
+                    match layout {
+                        LayoutConstraint::Shallow => {
+                            ui.horizontal(|ui| {
+                                ui.label(format!("{}:", k));
+                                display(ui, ctx, &v, format!("{key}.{k}"));
+                            });
+                        }
+                        LayoutConstraint::Deep => {
+                            let id = ui.make_persistent_id((&key, k));
+                            let mut state =
+                                CollapsingState::load_with_default_open(&ui.ctx(), id, false);
+
+                            let id_toggle = ui.make_persistent_id((id, "toggle"));
+                            let should_toggle: bool =
+                                ui.memory_mut(|m| m.data.get_temp(id_toggle).unwrap_or_default());
+                            if should_toggle {
+                                state.toggle(ui);
+                                ui.memory_mut(|m| {
+                                    let should_toggle =
+                                        m.data.get_temp_mut_or_default::<bool>(id_toggle);
+                                    *should_toggle = false;
+                                });
+                            }
+
+                            state
+                                .show_header(ui, |ui| {
+                                    let resp = ui.vertical(|ui| ui.label(k));
+                                    let id_interact = ui.make_persistent_id((id, "interact"));
+                                    if ui
+                                        .interact(resp.response.rect, id_interact, Sense::click())
+                                        .clicked()
+                                    {
+                                        ui.memory_mut(|m| {
+                                            let should_toggle =
+                                                m.data.get_temp_mut_or_default::<bool>(id_toggle);
+                                            *should_toggle = true;
+                                        });
+                                    }
+
+                                    if let Some(actions) = ctx.actions {
+                                        let btn = Button::image(egui::Image::new(
+                                            egui::include_image!("../../assets/breakpoint.png"),
+                                        ))
+                                        .corner_radius(5.0)
+                                        .frame(false);
+
+                                        if ui.add(btn).clicked() {
+                                            actions
+                                                .send(ActionReq::Breakpoint((
+                                                    ctx.node.clone(),
+                                                    format!("{key}.{k}")
+                                                        .trim_matches('.')
+                                                        .to_string(),
+                                                    Some(value.clone()),
+                                                )))
+                                                .expect("failed to send");
+                                        }
+                                    }
+                                })
+                                .body(|ui| {
+                                    display(ui, ctx, v, format!("{key}.{k}"));
+                                });
+                        }
+                    }
+                }
+            });
+
+            return;
+        }
+
+        Value::Sequence(seq) if seq.is_empty() => {
+            ui.label("[]");
+        }
         Value::Sequence(seq) => {
-            CollapsingHeader::new(&key).show(ui, |ui| {
-                for (i, value) in seq.iter().enumerate() {
-                    display_value(
-                        ui,
-                        module,
-                        actions,
-                        format!("{global_key}.{i}"),
-                        i.to_string(),
-                        value,
-                    );
+            ui.vertical(|ui| {
+                for (i, v) in seq.iter().enumerate() {
+                    display(ui, ctx, &v, format!("{key}.{i}"));
                     if i != seq.len() - 1 {
                         ui.separator();
                     }
                 }
             });
-        }
-        Value::Mapping(mapping) => {
-            ui.horizontal(|ui| {
-                let id = ui.make_persistent_id(&global_key);
-                ui.vertical(|ui| {
-                    let mut state = CollapsingState::load_with_default_open(ui.ctx(), id, false);
-                    let id_toggle = ui.make_persistent_id((id, "toggle"));
-
-                    let should_toggle: bool =
-                        ui.memory_mut(|m| m.data.get_temp(id_toggle).unwrap_or_default());
-
-                    if should_toggle {
-                        state.toggle(ui);
-                        ui.memory_mut(|m| {
-                            let should_toggle = m.data.get_temp_mut_or_default::<bool>(id_toggle);
-                            *should_toggle = false;
-                        });
-                    }
-
-                    state
-                        .show_header(ui, |ui| {
-                            let resp = ui.vertical(|ui| ui.label(key));
-                            let id_interact = ui.make_persistent_id((id, "interact"));
-                            if ui
-                                .interact(resp.response.rect, id_interact, Sense::click())
-                                .clicked()
-                            {
-                                ui.memory_mut(|m| {
-                                    let should_toggle =
-                                        m.data.get_temp_mut_or_default::<bool>(id_toggle);
-                                    *should_toggle = true;
-                                });
-                            }
-
-                            if let Some(actions) = actions {
-                                let btn = Button::image(egui::Image::new(egui::include_image!(
-                                    "../../assets/breakpoint.png"
-                                )))
-                                .corner_radius(5.0)
-                                .frame(false);
-
-                                if ui.add(btn).clicked() {
-                                    actions
-                                        .send(ActionReq::Breakpoint((
-                                            module.clone(),
-                                            global_key.trim_matches('.').to_string(),
-                                            Some(value.clone()),
-                                        )))
-                                        .expect("failed to send");
-                                }
-                            }
-                        })
-                        .body(|ui| {
-                            for (key, value) in mapping {
-                                let key = key.as_str().unwrap().to_string();
-                                display_value(
-                                    ui,
-                                    module,
-                                    actions,
-                                    format!("{global_key}.{key}"),
-                                    key,
-                                    value,
-                                );
-                            }
-                        });
-                });
-            });
+            return;
         }
 
         Value::Tagged(tagged) => {
             ui.horizontal(|ui| {
-                display_value(
-                    ui,
-                    module,
-                    actions,
-                    global_key,
-                    format!("{key} ({})", tagged.tag.string),
-                    &tagged.value,
-                )
+                CollapsingHeader::new(tagged.tag.to_string().trim_start_matches('!'))
+                    .default_open(true)
+                    .show(ui, |ui| display(ui, ctx, &tagged.value, key.clone()))
             });
+            return;
         }
 
-        _ => {
-            ui.horizontal(|ui| {
-                ui.label(key);
-                value_to_label(ui, value, module, global_key, actions);
-            });
+        Value::String(s) => {
+            ui.label(s);
+        }
+        Value::Number(n) => {
+            ui.label(n.to_string());
+            if let Some(actions) = ctx.actions {
+                if ui.button("Observe").clicked() {
+                    actions
+                        .send(ActionReq::Trace((
+                            ctx.node.clone(),
+                            key.trim_matches('.').to_string(),
+                        )))
+                        .expect("failed to send");
+                }
+            }
+        }
+        Value::Null => {
+            ui.label("null");
+        }
+        Value::Bool(b) => {
+            ui.label(b.to_string());
         }
     }
-}
 
-pub fn value_to_label(
-    ui: &mut egui::Ui,
-    value: &Value,
-    module: &ObjectPath,
-    global_key: String,
-    actions: Option<&Sender<ActionReq>>,
-) {
-    ui.horizontal(|ui| {
-        match value {
-            Value::String(s) => ui.label(s),
-            Value::Number(n) => {
-                ui.label(n.to_string());
-                if let Some(actions) = actions {
-                    if ui.button("Observe").clicked() {
-                        actions
-                            .send(ActionReq::Trace((
-                                module.clone(),
-                                global_key.trim_matches('.').to_string(),
-                            )))
-                            .expect("failed to send");
-                    }
-                }
-                ui.response()
-            }
-            Value::Null => ui.label("null"),
-            Value::Bool(b) => ui.label(b.to_string()),
-            Value::Sequence(seq) if seq.is_empty() => ui.label("[]"),
-            _ => ui.label(format!("??? ({value:?})")),
-        };
+    if let Some(actions) = ctx.actions {
+        let btn = Button::image(egui::Image::new(egui::include_image!(
+            "../../assets/breakpoint.png"
+        )))
+        .corner_radius(5.0)
+        .frame(false);
 
-        if let Some(actions) = actions {
-            let btn = Button::image(egui::Image::new(egui::include_image!(
-                "../../assets/breakpoint.png"
-            )))
-            .corner_radius(5.0)
-            .frame(false);
-
-            if ui.add(btn).clicked() {
-                actions
-                    .send(ActionReq::Breakpoint((
-                        module.clone(),
-                        global_key.trim_matches('.').to_string(),
-                        Some(value.clone()),
-                    )))
-                    .expect("failed to send");
-            }
+        if ui.add(btn).clicked() {
+            actions
+                .send(ActionReq::Breakpoint((
+                    ctx.node.clone(),
+                    key.trim_matches('.').to_string(),
+                    Some(value.clone()),
+                )))
+                .expect("failed to send");
         }
-    });
+    }
 }
 
 fn color_for_log(level: Level) -> Color32 {

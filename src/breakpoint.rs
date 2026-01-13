@@ -3,9 +3,13 @@ use std::ops::ControlFlow;
 use des::net::ObjectPath;
 use egui::{ComboBox, Context, RichText, ScrollArea, SidePanel};
 use fxhash::FxHashMap;
-use serde_yml::Value;
+use serde_norway::Value;
 
-use crate::{Application, inspector::display_value, plot::access};
+use crate::{
+    Application,
+    inspector::{Ctx, display},
+    plot::access,
+};
 
 #[derive(Debug)]
 pub struct Breakpoint {
@@ -14,6 +18,7 @@ pub struct Breakpoint {
     pub kind: BreakpointKind,
     pub last: Option<Value>,
     pub triggered: bool,
+    pub remove: bool,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -100,9 +105,24 @@ impl Application {
 
                         // body
                         if let Some(ref last) = b.last {
-                            display_value(ui, &b.path, None, b.key.clone(), b.key.clone(), last);
+                            ui.label(format!("{}: ", b.key));
+
+                            display(
+                                ui,
+                                Ctx {
+                                    node: &b.path,
+                                    actions: None,
+                                },
+                                last,
+                                b.key.clone(),
+                            );
                         } else {
                             ui.label(&b.key);
+                        }
+
+                        // remove
+                        if ui.button("Remove").clicked() {
+                            b.remove = true;
                         }
                     });
                 }
