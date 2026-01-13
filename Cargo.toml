@@ -15,7 +15,6 @@ serde_norway = "*"
 tracing = { version = "0.1.41", features = ["log"] }
 tracing-subscriber = { version = "0.3.19", features = ["env-filter"] }
 
-serde-value = { path = "../serde-value" }
 petgraph = "0.8.3"
 tracing-error = "0.2.1"
 tracing-forest = "0.3.0"
