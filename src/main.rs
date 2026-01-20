@@ -5,12 +5,6 @@
 //
 #[cfg(not(target_arch = "wasm32"))]
 fn main() -> eframe::Result {
-    let mut native_options = eframe::NativeOptions::default();
-    native_options.viewport.maximized = Some(true);
-
-    eframe::run_native(
-        "des-gui",
-        native_options,
-        Box::new(|cc| Ok(Box::new(des_gui::Application::new(cc, des_gui::sim::sim)))),
-    )
+    use des_gui::launch_with_gui;
+    launch_with_gui(des_gui::sim::sim)
 }

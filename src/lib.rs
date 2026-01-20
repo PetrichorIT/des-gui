@@ -9,7 +9,7 @@ use plot::{Tracer, TreeTracer};
 use serde_norway::{Mapping, Value};
 use std::{
     borrow::Cow,
-    env::{self, temp_dir},
+    env::{self, temp_dir, var},
     fs::{self, File},
     io::Write,
     mem::{self, forget},
@@ -20,12 +20,7 @@ use std::{
     time::{Duration, Instant},
 };
 use tracing_error::ErrorLayer;
-use tracing_subscriber::{
-    EnvFilter,
-    filter::Directive,
-    fmt::{Layer, format},
-    layer::SubscriberExt,
-};
+use tracing_subscriber::{EnvFilter, filter::Directive, fmt::Layer, layer::SubscriberExt};
 
 pub mod sim;
 pub mod tracing;
@@ -41,6 +36,12 @@ use tracing::GuiTracingObserver;
 pub fn launch_with_gui(f: impl FnOnce() -> Runtime<Sim<()>>) -> eframe::Result {
     let mut native_options = eframe::NativeOptions::default();
     native_options.viewport.maximized = Some(true);
+
+    let supress = var("DES_NOGUI").is_ok_and(|v| v == "1");
+    if supress {
+        let _ = f().run().assert_no_err();
+        return Ok(());
+    }
 
     eframe::run_native(
         "des-gui",
@@ -156,7 +157,8 @@ impl Rt {
 #[derive(Default, Debug)]
 pub struct ExecutionParameters {
     limit: Option<usize>,
-    pre_frame_count: usize,
+    per_frame_count: usize,
+    per_event_time: Duration,
 }
 
 impl Application {
@@ -206,7 +208,8 @@ impl Application {
 
             param: ExecutionParameters {
                 limit: Some(0),
-                pre_frame_count: 0,
+                per_frame_count: 0,
+                per_event_time: Duration::ZERO,
             },
             rt: Rt::Runtime(runtime),
             logs: gui_capture,
@@ -274,11 +277,24 @@ impl Application {
                 && runtime.num_events_remaining() > 0)
                 || !runtime.was_started();
             if can_progress {
-                let steps = self.param.pre_frame_count as usize;
+                if self.param.per_frame_count >= 1_000
+                    && !self.frame_time.is_zero()
+                    && !self.param.per_event_time.is_zero()
+                {
+                    // STEPS MAX
+                    const FRAME_MAX: Duration = Duration::from_millis(33);
+                    let remaining = FRAME_MAX.saturating_sub(self.frame_time).as_secs_f64();
+                    let count = remaining / self.param.per_event_time.as_secs_f64() / 1.5;
+                    self.param.per_frame_count = (count as usize).max(1_000);
+                }
+
+                let steps = self.param.per_frame_count;
+
                 if !runtime.was_started() {
                     runtime.start().expect("failed to start");
                 }
 
+                let t0 = Instant::now();
                 'outer: for _ in 0..steps {
                     runtime
                         .dispatch_n_events(1)
@@ -294,6 +310,9 @@ impl Application {
                     }
                 }
 
+                if steps > 0 {
+                    self.param.per_event_time = t0.elapsed() / steps as u32;
+                }
                 // Update not per event but per frame: TODO is that a good idea?
                 self.traces
                     .iter_mut()

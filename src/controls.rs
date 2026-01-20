@@ -46,7 +46,7 @@ impl Application {
                             self.param.limit = Some(1);
                         }
 
-                        let slider = Slider::new(&mut self.param.pre_frame_count, 1..=1_000)
+                        let slider = Slider::new(&mut self.param.per_frame_count, 1..=1_000)
                             .show_value(true)
                             .integer()
                             .suffix(" events pre frame")
